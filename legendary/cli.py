@@ -28,7 +28,7 @@ from legendary.utils.env import is_windows_mac_or_pyi
 from legendary.lfs.eos import add_registry_entries, query_registry_entries, remove_registry_entries
 from legendary.lfs.utils import validate_files, clean_filename
 from legendary.utils.selective_dl import get_sdl_appname
-from legendary.lfs.wine_helpers import read_registry, get_shell_folders
+from legendary.lfs.wine_helpers import read_registry, get_shell_folders, case_insensitive_file_search
 
 # todo custom formatter for cli logger (clean info, highlighted error/warning)
 logging.basicConfig(
@@ -315,7 +315,7 @@ class LegendaryCLI:
 
         print('\nInstalled games:')
         for game in games:
-            if game.install_size == 0:
+            if game.install_size == 0 and self.core.lgd.lock_installed():
                 logger.debug(f'Updating missing size for {game.app_name}')
                 m = self.core.load_manifest(self.core.get_installed_manifest(game.app_name)[0])
                 game.install_size = sum(fm.file_size for fm in m.file_manifest_list.elements)
@@ -415,7 +415,11 @@ class LegendaryCLI:
         print('Save games:')
         for save in sorted(saves, key=lambda a: a.app_name + a.manifest_name):
             if save.app_name != last_app:
-                game_title = self.core.get_game(save.app_name).app_title
+                if game := self.core.get_game(save.app_name):
+                    game_title = game.app_title
+                else:
+                    game_title = 'Unknown'
+
                 last_app = save.app_name
                 print(f'- {game_title} ("{save.app_name}")')
             print(' +', save.manifest_name)
@@ -449,7 +453,7 @@ class LegendaryCLI:
             igames = [igame]
 
         # check available saves
-        saves = self.core.get_save_games()
+        saves = self.core.get_save_games(args.app_name if args.app_name else '')
         latest_save = {
             save.app_name: save for save in sorted(saves, key=lambda a: a.datetime)
         }
@@ -468,12 +472,15 @@ class LegendaryCLI:
             logger.info(f'Checking "{igame.title}" ({igame.app_name})')
             # override save path only if app name is specified
             if args.app_name and args.save_path:
+                if not self.core.lgd.lock_installed():
+                    logger.error('Unable to lock install data, cannot modify save path.')
+                    break
                 logger.info(f'Overriding save path with "{args.save_path}"...')
                 igame.save_path = args.save_path
                 self.core.lgd.set_installed_game(igame.app_name, igame)
 
-            # if there is no saved save path, try to get one
-            if not igame.save_path:
+            # if there is no saved save path, try to get one, skip if we cannot get a install data lock
+            if not igame.save_path and self.core.lgd.lock_installed():
                 if args.yes and not args.accept_path:
                     logger.info('Save path for this title has not been set, skipping due to --yes')
                     continue
@@ -795,6 +802,11 @@ class LegendaryCLI:
             subprocess.Popen(command, env=full_env)
 
     def install_game(self, args):
+        if not self.core.lgd.lock_installed():
+            logger.fatal('Failed to acquire installed data lock, only one instance of Legendary may '
+                         'install/import/move applications at a time.')
+            return
+
         args.app_name = self._resolve_aliases(args.app_name)
         if self.core.is_installed(args.app_name):
             igame = self.core.get_installed_game(args.app_name)
@@ -975,6 +987,11 @@ class LegendaryCLI:
                 self.core.uninstall_tag(old_igame)
                 self.core.install_game(old_igame)
 
+            # check if the version changed, this can happen for DLC that gets a version bump with no actual file changes
+            if old_igame and old_igame.version != igame.version:
+                old_igame.version = igame.version
+                self.core.install_game(old_igame)
+
             exit(0)
 
         logger.info(f'Install size: {analysis.install_size / 1024 / 1024:.02f} MiB')
@@ -1123,6 +1140,11 @@ class LegendaryCLI:
             logger.info('Automatic installation not available on Linux.')
 
     def uninstall_game(self, args):
+        if not self.core.lgd.lock_installed():
+            logger.fatal('Failed to acquire installed data lock, only one instance of Legendary may '
+                         'install/import/move applications at a time.')
+            return
+
         args.app_name = self._resolve_aliases(args.app_name)
         igame = self.core.get_installed_game(args.app_name)
         if not igame:
@@ -1133,6 +1155,9 @@ class LegendaryCLI:
             if not get_boolean_choice(f'Do you wish to uninstall "{igame.title}"?', default=False):
                 print('Aborting...')
                 exit(0)
+
+        if os.name == 'nt' and igame.uninstaller and not args.skip_uninstaller:
+            self._handle_uninstaller(igame, args.yes)
 
         try:
             if not igame.is_dlc:
@@ -1149,6 +1174,23 @@ class LegendaryCLI:
             logger.info('Game has been uninstalled.')
         except Exception as e:
             logger.warning(f'Removing game failed: {e!r}, please remove {igame.install_path} manually.')
+
+    def _handle_uninstaller(self, igame, yes=False):
+        uninstaller = igame.uninstaller
+
+        print('\nThis game provides the following uninstaller:')
+        print(f'- {uninstaller["path"]} {uninstaller["args"]}\n')
+        
+        if yes or get_boolean_choice('Do you wish to run the uninstaller?', default=True):
+            logger.info('Running uninstaller...')
+            req_path, req_exec = os.path.split(uninstaller['path'])
+            work_dir = os.path.join(igame.install_path, req_path)
+            fullpath = os.path.join(work_dir, req_exec)
+            try:
+                p = subprocess.Popen([fullpath, uninstaller['args']], cwd=work_dir, shell=True)
+                p.wait()
+            except Exception as e:
+                logger.error(f'Failed to run uninstaller: {e!r}')
 
     def verify_game(self, args, print_command=True, repair_mode=False, repair_online=False):
         args.app_name = self._resolve_aliases(args.app_name)
@@ -1253,6 +1295,11 @@ class LegendaryCLI:
                 logger.info(f'Run "legendary repair {args.app_name}" to repair your game installation.')
 
     def import_game(self, args):
+        if not self.core.lgd.lock_installed():
+            logger.fatal('Failed to acquire installed data lock, only one instance of Legendary may '
+                         'install/import/move applications at a time.')
+            return
+
         # make sure path is absolute
         args.app_path = os.path.abspath(args.app_path)
         args.app_name = self._resolve_aliases(args.app_name)
@@ -1291,6 +1338,8 @@ class LegendaryCLI:
         # get everything needed for import from core, then run additional checks.
         manifest, igame = self.core.import_game(game, args.app_path, platform=args.platform)
         exe_path = os.path.join(args.app_path, manifest.meta.launch_exe.lstrip('/'))
+        if os.name != 'nt':
+            exe_path = case_insensitive_file_search(exe_path)
         # check if most files at least exist or if user might have specified the wrong directory
         total = len(manifest.file_manifest_list.elements)
         found = sum(os.path.exists(os.path.join(args.app_path, f.filename))
@@ -1346,6 +1395,11 @@ class LegendaryCLI:
         logger.info(f'{"DLC" if game.is_dlc else "Game"} "{game.app_title}" has been imported.')
 
     def egs_sync(self, args):
+        if not self.core.lgd.lock_installed():
+            logger.fatal('Failed to acquire installed data lock, only one instance of Legendary may '
+                         'install/import/move applications at a time.')
+            return
+
         if args.unlink:
             logger.info('Unlinking and resetting EGS and LGD sync...')
             self.core.lgd.config.remove_option('Legendary', 'egl_programdata')
@@ -1653,18 +1707,18 @@ class LegendaryCLI:
                     if dlc['entitlementName'] in owned_entitlements:
                         owned_dlc.append((installable, None, dlc['title'], dlc['id']))
                     elif installable:
-                        app_name = dlc['releaseInfo'][0]['appId']
-                        if app_name in owned_app_names:
-                            owned_dlc.append((installable, app_name, dlc['title'], dlc['id']))
+                        dlc_app_name = dlc['releaseInfo'][0]['appId']
+                        if dlc_app_name in owned_app_names:
+                            owned_dlc.append((installable, dlc_app_name, dlc['title'], dlc['id']))
 
                 if owned_dlc:
                     human_list = []
                     json_list = []
-                    for installable, app_name, title, dlc_id in owned_dlc:
-                        json_list.append(dict(app_name=app_name, title=title,
+                    for installable, dlc_app_name, title, dlc_id in owned_dlc:
+                        json_list.append(dict(app_name=dlc_app_name, title=title,
                                               installable=installable, id=dlc_id))
                         if installable:
-                            human_list.append(f'App name: {app_name}, Title: "{title}"')
+                            human_list.append(f'App name: {dlc_app_name}, Title: "{title}"')
                         else:
                             human_list.append(f'Title: "{title}" (no installation required)')
                     game_infos.append(InfoItem('Owned DLC', 'owned_dlc', human_list, json_list))
@@ -1748,6 +1802,17 @@ class LegendaryCLI:
                                                    args=manifest.meta.prereq_args)))
             else:
                 manifest_info.append(InfoItem('Prerequisites', 'prerequisites', None, None))
+
+            if manifest.meta.uninstall_action_path:
+                human_list = [
+                    f'Uninstaller path: {manifest.meta.uninstall_action_path}',
+                    f'Uninstaller args: {manifest.meta.uninstall_action_args or "(None)"}',
+                ]
+                manifest_info.append(InfoItem('Uninstaller', 'uninstaller', human_list,
+                                              dict(path=manifest.meta.uninstall_action_path,
+                                                   args=manifest.meta.uninstall_action_args)))
+            else:
+                manifest_info.append(InfoItem('Uninstaller', 'uninstaller', None, None))
 
             install_tags = {''}
             for fm in manifest.file_manifest_list.elements:
@@ -2501,6 +2566,11 @@ class LegendaryCLI:
             logger.info('Saved choices to configuration.')
 
     def move(self, args):
+        if not self.core.lgd.lock_installed():
+            logger.fatal('Failed to acquire installed data lock, only one instance of Legendary may '
+                         'install/import/move applications at a time.')
+            return
+
         app_name = self._resolve_aliases(args.app_name)
         igame = self.core.get_installed_game(app_name, skip_sync=True)
         if not igame:
@@ -2538,6 +2608,10 @@ class LegendaryCLI:
 
 
 def main():
+    # Set output encoding to UTF-8 if not outputting to a terminal
+    if not stdout.isatty():
+        stdout.reconfigure(encoding='utf-8')
+
     parser = argparse.ArgumentParser(description=f'Legendary v{__version__} - "{__codename__}"')
     parser.register('action', 'parsers', HiddenAliasSubparsersAction)
 
@@ -2706,6 +2780,8 @@ def main():
 
     uninstall_parser.add_argument('--keep-files', dest='keep_files', action='store_true',
                                   help='Keep files but remove game from Legendary database')
+    uninstall_parser.add_argument('--skip-uninstaller', dest='skip_uninstaller', action='store_true',
+                                  help='Skip running the uninstaller')
 
     launch_parser.add_argument('--offline', dest='offline', action='store_true',
                                default=False, help='Skip login and launch game without online authentication')
