@@ -717,7 +717,10 @@ class LegendaryCLI:
             if params.environment:
                 logger.debug('Environment overrides: {}'.format(', '.join(
                     f'{k}={v}' for k, v in params.environment.items())))
-            subprocess.Popen(full_params, cwd=params.working_directory, env=full_env)
+            p = subprocess.Popen(full_params, cwd=params.working_directory, env=full_env)
+            if args.wait:
+                logger.debug('Waiting for program to finish...')
+                p.wait()
 
     def _launch_origin(self, args):
         game = self.core.get_game(app_name=args.app_name)
@@ -2843,6 +2846,8 @@ def main():
                                help='Launch Origin to activate or run the game.')
     launch_parser.add_argument('--json', dest='json', action='store_true',
                                help='Print launch information as JSON and exit')
+    launch_parser.add_argument('--wait', dest='wait', action='store_true',
+                               help='Wait for the game to finish running (works inconsistently)')
 
     if os.name != 'nt':
         launch_parser.add_argument('--wine', dest='wine_bin', action='store', metavar='<wine binary>',
