@@ -4,16 +4,22 @@ import json
 import os
 import logging
 
+from contextlib import contextmanager
 from collections import defaultdict
 from pathlib import Path
 from time import time
 
-from .utils import clean_filename
+from filelock import FileLock
+
+from .utils import clean_filename, LockedJSONData
 
 from legendary.models.game import *
 from legendary.utils.aliasing import generate_aliases
 from legendary.models.config import LGDConf
 from legendary.utils.env import is_windows_mac_or_pyi
+
+
+FILELOCK_DEBUG = False
 
 
 class LGDLFS:
@@ -84,6 +90,11 @@ class LGDLFS:
                 self.log.warning(f'Removing "{os.path.join(self.path, "manifests", "old")}" folder failed: '
                                  f'{e!r}, please remove manually')
 
+        if not FILELOCK_DEBUG:
+            # Prevent filelock logger from spamming Legendary debug output
+            filelock_logger = logging.getLogger('filelock')
+            filelock_logger.setLevel(logging.INFO)
+
         # try loading config
         try:
             self.config.read(self.config_path)
@@ -104,6 +115,8 @@ class LGDLFS:
         if not self.config.has_option('Legendary', 'disable_update_notice'):
             self.config.set('Legendary', '; Disables the notice about an available update on exit')
             self.config.set('Legendary', 'disable_update_notice', 'false' if is_windows_mac_or_pyi() else 'true')
+
+        self._installed_lock = FileLock(os.path.join(self.path, 'installed.json') + '.lock')
 
         try:
             self._installed = json.load(open(os.path.join(self.path, 'installed.json')))
@@ -131,30 +144,34 @@ class LGDLFS:
                 self.log.debug(f'Loading aliases failed with {e!r}')
 
     @property
+    @contextmanager
+    def userdata_lock(self) -> LockedJSONData:
+        """Wrapper around the lock to automatically update user data when it is released"""
+        with LockedJSONData(os.path.join(self.path, 'user.json')) as lock:
+            try:
+                yield lock
+            finally:
+                self._user_data = lock.data
+
+    @property
     def userdata(self):
         if self._user_data is not None:
             return self._user_data
 
         try:
-            self._user_data = json.load(open(os.path.join(self.path, 'user.json')))
-            return self._user_data
+            with self.userdata_lock as locked:
+                return locked.data
         except Exception as e:
             self.log.debug(f'Failed to load user data: {e!r}')
             return None
 
     @userdata.setter
     def userdata(self, userdata):
-        if userdata is None:
-            raise ValueError('Userdata is none!')
-
-        self._user_data = userdata
-        json.dump(userdata, open(os.path.join(self.path, 'user.json'), 'w'),
-                  indent=2, sort_keys=True)
+        raise NotImplementedError('The setter has been removed, use the locked userdata instead.')
 
     def invalidate_userdata(self):
-        self._user_data = None
-        if os.path.exists(os.path.join(self.path, 'user.json')):
-            os.remove(os.path.join(self.path, 'user.json'))
+        with self.userdata_lock as lock:
+            lock.clear()
 
     @property
     def entitlements(self):
@@ -279,6 +296,27 @@ class LGDLFS:
                     os.remove(os.path.join(self.path, 'manifests', f))
                 except Exception as e:
                     self.log.warning(f'Failed to delete file "{f}": {e!r}')
+
+    def lock_installed(self) -> bool:
+        """
+        Locks the install data. We do not care about releasing this lock.
+        If it is acquired by a Legendary instance it should own the lock until it exits.
+        Some operations such as egl sync may be simply skipped if a lock cannot be acquired
+        """
+        if self._installed_lock.is_locked:
+            return True
+
+        try:
+            self._installed_lock.acquire(blocking=False)
+            # reload data in case it has been updated elsewhere
+            try:
+                self._installed = json.load(open(os.path.join(self.path, 'installed.json')))
+            except Exception as e:
+                self.log.debug(f'Failed to load installed game data: {e!r}')
+
+            return True
+        except TimeoutError:
+            return False
 
     def get_installed_game(self, app_name):
         if self._installed is None:
