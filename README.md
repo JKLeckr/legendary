@@ -517,6 +517,7 @@ optional arguments:
                         Override executable to launch (relative path)
   --origin              Launch Origin to activate or run the game.
   --json                Print launch information as JSON and exit
+  --wait                Wait for the game to finish running (works inconsistently)
   --wine <wine binary>  Set WINE binary to use to launch the app
   --wine-prefix <wine pfx path>
                         Set WINE prefix to use
