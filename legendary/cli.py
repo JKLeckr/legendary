@@ -694,7 +694,9 @@ class LegendaryCLI:
             if params.environment:
                 logger.debug('Environment overrides: {}'.format(', '.join(
                     f'{k}={v}' for k, v in params.environment.items())))
-            subprocess.Popen(full_params, cwd=params.working_directory, env=full_env)
+            p = subprocess.Popen(full_params, cwd=params.working_directory, env=full_env)
+            logger.debug('Waiting for game to finish...')
+            p.wait()
 
     def _launch_origin(self, args):
         game = self.core.get_game(app_name=args.app_name)
